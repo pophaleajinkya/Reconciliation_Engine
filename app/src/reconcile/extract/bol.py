@@ -5,6 +5,14 @@ Bill of Lading text quality varies wildly — package 1's BOL renders to nearly
 no text, package 2's BOL renders cleanly. We use text parse when we can see
 line data, otherwise we fall back to vision (which is also where we look for
 receiving stamps, handwritten shortage notes, etc.).
+
+Multi-page BOLs (e.g. package 1) sometimes bundle DIFFERENT shipments on
+different pages. We extract every page independently so each line carries
+its source `page_number`, then cluster pages by header (BOL #, ship-to,
+PO #) — page 1's header is the *primary* shipment. Lines from any
+disagreeing page are kept (so the UI can show them) but tagged
+`belongs_to_primary_shipment=False` so the matcher / decision rubric
+ignores them.
 """
 
 from __future__ import annotations
@@ -12,7 +20,7 @@ from __future__ import annotations
 import logging
 import re
 
-from reconcile.ingest.renderer import RenderedPDF
+from reconcile.ingest.renderer import RenderedPDF, RenderedPage
 from reconcile.llm.groq_client import extract_json_from_image
 from reconcile.schemas import (
     BillOfLading,
@@ -49,18 +57,27 @@ def _text_parse(rendered: RenderedPDF) -> BillOfLading | None:
     if rendered.text_len < 300:
         return None
 
-    norm = re.sub(r"[\t ]+", " ", text)
-    lines = []
-    for m in _LINE_RE.finditer(norm):
-        lines.append(
-            ShippedLine(
-                material_number=m.group("material"),
-                description=m.group("desc").strip(),
-                cases=float(m.group("cases")),
-                weight=float(m.group("weight").replace(",", "")),
-                customer_sku=m.group("sku"),
+    # Run the line-item regex per page so each parsed line knows which
+    # page it came from. This lets the cross-shipment filter operate
+    # uniformly whether we use the text or vision path.
+    lines: list[ShippedLine] = []
+    for page in rendered.pages:
+        chosen = page.text or page.ocr_text or ""
+        if not chosen.strip():
+            continue
+        norm = re.sub(r"[\t ]+", " ", chosen)
+        for m in _LINE_RE.finditer(norm):
+            lines.append(
+                ShippedLine(
+                    material_number=m.group("material"),
+                    description=m.group("desc").strip(),
+                    cases=float(m.group("cases")),
+                    weight=float(m.group("weight").replace(",", "")),
+                    customer_sku=m.group("sku"),
+                    page_number=page.page_num,
+                    belongs_to_primary_shipment=True,
+                )
             )
-        )
     if not lines:
         return None
 
@@ -68,6 +85,8 @@ def _text_parse(rendered: RenderedPDF) -> BillOfLading | None:
     pro_m = _PRO_RE.search(text)
     po_m = _PO_RE.search(text)
     date_m = _SHIP_DATE_RE.search(text)
+
+    primary_pages = sorted({ln.page_number for ln in lines if ln.page_number})
 
     return BillOfLading(
         source_path=str(rendered.source_path),
@@ -80,83 +99,223 @@ def _text_parse(rendered: RenderedPDF) -> BillOfLading | None:
         ship_date=date_m.group(1) if date_m else None,
         lines=lines,
         total_cases=sum(ln.cases or 0 for ln in lines) or None,
+        primary_shipment_pages=primary_pages,
     )
+
+
+_PAGE_SCHEMA_HINT = (
+    "{"
+    '"bol_number": str|null,'
+    '"pro_number": str|null,'
+    '"po_number": str|null,'
+    '"ship_date": str|null,'
+    '"ship_to": str|null,'
+    '"carrier": str|null,'
+    '"lines": ['
+    '  {"material_number": str|null, "customer_sku": str|null,'
+    '   "description": str|null, "cases": number|null, "weight": number|null}'
+    "],"
+    '"total_cases": number|null,'
+    '"receiving": {'
+    '  "has_receiving_stamp": bool,'
+    '  "stamp_notes": str|null,'
+    '  "total_cases_shipped": number|null,'
+    '  "total_cases_received": number|null,'
+    '  "aggregate_shortage": bool,'
+    '  "line_level_exceptions": [str]'
+    "}"
+    "}"
+)
+
+
+_PAGE_SYSTEM_PROMPT = (
+    "You are extracting data from a SINGLE page of a Bill of Lading / "
+    "Delivery Order. Extract ONLY what is visible on this page — do not "
+    "infer values from prior pages or invent line items. If the page "
+    "shows a receiving stamp, signature, or handwritten notes about "
+    "totals, shortages, or damages, capture them in `receiving`. The "
+    "header (bol_number, po_number, ship_to, carrier, ship_date) should "
+    "reflect what THIS page says, even if it disagrees with another page. "
+    "Cross-shipment detection is performed downstream by comparing "
+    "headers — your job is faithful per-page extraction."
+)
+
+
+def _extract_page(page: RenderedPage) -> dict:
+    """Run the vision LLM on a single BOL page; return the raw JSON payload."""
+    if not page.image_path:
+        return {}
+    try:
+        return extract_json_from_image(
+            system_prompt=_PAGE_SYSTEM_PROMPT,
+            schema_hint=_PAGE_SCHEMA_HINT,
+            image_paths=[page.image_path],
+            user_hint=(
+                f"This is page {page.page_num} of the document. "
+                "Return receiving evidence even if partial. Prefer the "
+                "handwritten total when both a printed and a written number "
+                "appear on the stamp."
+            ),
+        )
+    except Exception as e:
+        log.warning("BOL vision page %d failed: %s", page.page_num, e)
+        return {}
+
+
+def _norm_header_key(s: str | None) -> str:
+    """Normalize a header field for cross-page comparison."""
+    if not s:
+        return ""
+    return re.sub(r"\s+", " ", str(s)).strip().upper()
+
+
+def _page_header_signature(payload: dict) -> tuple[str, str, str]:
+    """A coarse fingerprint for clustering pages into shipments."""
+    return (
+        _norm_header_key(payload.get("bol_number")),
+        _norm_header_key(payload.get("po_number")),
+        _norm_header_key(payload.get("ship_to")),
+    )
+
+
+def _signatures_agree(a: tuple[str, str, str], primary: tuple[str, str, str]) -> bool:
+    """
+    A page agrees with the primary shipment when at least one of its
+    populated header fields matches AND no populated field disagrees.
+
+    We compare conservatively because OCR/vision can drop a single field
+    on a page; we only flag a page as cross-shipment when there's
+    affirmative disagreement on a field both pages have.
+    """
+    have_match = False
+    for ai, pi in zip(a, primary):
+        if not ai or not pi:
+            continue
+        if ai == pi:
+            have_match = True
+        else:
+            return False
+    # If neither side had any populated overlapping field, treat as
+    # agreeing — we can't prove disagreement.
+    return have_match or not any(a) or not any(primary)
 
 
 def _vision_parse(rendered: RenderedPDF) -> BillOfLading:
-    schema_hint = (
-        "{"
-        '"bol_number": str|null,'
-        '"pro_number": str|null,'
-        '"po_number": str|null,'
-        '"ship_date": str|null,'
-        '"ship_to": str|null,'
-        '"carrier": str|null,'
-        '"content_belongs_to_different_shipment": bool,'
-        '"lines": ['
-        '  {"material_number": str|null, "customer_sku": str|null,'
-        '   "description": str|null, "cases": number|null, "weight": number|null}'
-        "],"
-        '"total_cases": number|null,'
-        '"receiving": {'
-        '  "has_receiving_stamp": bool,'
-        '  "stamp_notes": str|null,'
-        '  "total_cases_shipped": number|null,'
-        '  "total_cases_received": number|null,'
-        '  "aggregate_shortage": bool,'
-        '  "line_level_exceptions": [str]'
-        "}"
-        "}"
-    )
-    imgs = rendered.image_paths()
-    if not imgs:
+    if not rendered.pages:
         return BillOfLading(
             source_path=str(rendered.source_path),
-            pages=len(rendered.pages),
+            pages=0,
             extraction_method=ExtractionMethod.VISION_LLM,
             extraction_confidence=0.1,
             parse_warnings=["No page images; vision skipped."],
         )
 
-    payload = extract_json_from_image(
-        system_prompt=(
-            "You are extracting data from a Bill of Lading / Delivery Order. "
-            "IMPORTANT: Look for any receiving stamp, signature, or handwritten "
-            "notes about totals, shortages, or damages. If the BOL text includes "
-            "an unrelated shipment (wrong BOL number, wrong ship-to, wrong PO), "
-            "set content_belongs_to_different_shipment=true and explain in "
-            "receiving.stamp_notes. Never invent line items."
-        ),
-        schema_hint=schema_hint,
-        image_paths=imgs,
-        user_hint=(
-            "Return receiving evidence even if partial. Prefer aggregate "
-            "totals_cases_received when handwritten on the stamp."
-        ),
-    )
+    page_payloads: list[tuple[RenderedPage, dict]] = []
+    for page in rendered.pages:
+        payload = _extract_page(page)
+        page_payloads.append((page, payload))
 
-    lines = [ShippedLine(**ln) for ln in payload.get("lines") or []]
-    recv_payload = payload.get("receiving") or {}
-    receiving = ReceivingEvidence(**recv_payload) if recv_payload else None
+    # Page 1 anchors the primary shipment.
+    primary_payload = page_payloads[0][1] if page_payloads else {}
+    primary_sig = _page_header_signature(primary_payload)
+
+    primary_pages: list[int] = []
+    cross_pages: list[int] = []
+    cross_details: list[dict] = []
+    all_lines: list[ShippedLine] = []
+    receivings_primary: list[ReceivingEvidence] = []
+
+    for page, payload in page_payloads:
+        sig = _page_header_signature(payload)
+        is_primary = _signatures_agree(sig, primary_sig)
+        if is_primary:
+            primary_pages.append(page.page_num)
+        else:
+            cross_pages.append(page.page_num)
+            cross_details.append(
+                {
+                    "page_number": page.page_num,
+                    "bol_number": payload.get("bol_number"),
+                    "po_number": payload.get("po_number"),
+                    "ship_to": payload.get("ship_to"),
+                    "carrier": payload.get("carrier"),
+                    "ship_date": payload.get("ship_date"),
+                    "reason": (
+                        "Header (BOL #, PO, ship-to) on this page disagrees "
+                        "with page 1; flagged as cross-shipment content."
+                    ),
+                }
+            )
+
+        for ln in payload.get("lines") or []:
+            try:
+                shipped = ShippedLine(**ln)
+            except Exception as e:
+                log.debug("BOL line skipped on page %d: %s", page.page_num, e)
+                continue
+            shipped.page_number = page.page_num
+            shipped.belongs_to_primary_shipment = is_primary
+            all_lines.append(shipped)
+
+        recv_payload = payload.get("receiving") or {}
+        if recv_payload and is_primary:
+            try:
+                receivings_primary.append(ReceivingEvidence(**recv_payload))
+            except Exception as e:
+                log.debug("BOL receiving skipped on page %d: %s", page.page_num, e)
+
+    primary_total = sum(
+        ln.cases or 0 for ln in all_lines if ln.belongs_to_primary_shipment
+    ) or None
+
+    receiving = _combine_receiving_payloads(receivings_primary)
+
+    cross_flag = bool(cross_pages)
+    parse_warnings: list[str] = []
+    if cross_flag:
+        parse_warnings.append(
+            f"Pages {cross_pages} appear to belong to a different shipment "
+            "than page 1; their lines are extracted but excluded from matching."
+        )
 
     return BillOfLading(
         source_path=str(rendered.source_path),
         pages=len(rendered.pages),
         extraction_method=ExtractionMethod.VISION_LLM,
-        extraction_confidence=0.7 if (lines or receiving) else 0.2,
-        bol_number=payload.get("bol_number"),
-        pro_number=payload.get("pro_number"),
-        po_number=payload.get("po_number"),
-        ship_to=payload.get("ship_to"),
-        carrier=payload.get("carrier"),
-        ship_date=payload.get("ship_date"),
-        content_belongs_to_different_shipment=bool(
-            payload.get("content_belongs_to_different_shipment")
-        ),
-        lines=lines,
-        total_cases=payload.get("total_cases"),
+        extraction_confidence=0.7 if (all_lines or receiving) else 0.2,
+        bol_number=primary_payload.get("bol_number"),
+        pro_number=primary_payload.get("pro_number"),
+        po_number=primary_payload.get("po_number"),
+        ship_to=primary_payload.get("ship_to"),
+        carrier=primary_payload.get("carrier"),
+        ship_date=primary_payload.get("ship_date"),
+        content_belongs_to_different_shipment=cross_flag,
+        lines=all_lines,
+        total_cases=primary_payload.get("total_cases") or primary_total,
         receiving=receiving,
+        primary_shipment_pages=primary_pages,
+        cross_shipment_pages=cross_pages,
+        cross_shipment_details=cross_details,
+        parse_warnings=parse_warnings,
     )
+
+
+def _combine_receiving_payloads(
+    payloads: list[ReceivingEvidence],
+) -> ReceivingEvidence | None:
+    """Fold multiple per-page receiving records into one for the primary shipment."""
+    if not payloads:
+        return None
+    if len(payloads) == 1:
+        return payloads[0]
+    # Reduce by reusing the existing pairwise merge so all the sanity
+    # guards (implausible numbers, narrative union) apply consistently.
+    folded = payloads[0]
+    for nxt in payloads[1:]:
+        merged = _merge_receiving(folded, nxt)
+        if merged is not None:
+            folded = merged
+    return folded
 
 
 # Handwritten receiving counts on a stamp are almost always 2-4 digits.

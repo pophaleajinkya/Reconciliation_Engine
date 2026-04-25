@@ -98,6 +98,15 @@ class ShippedLine(BaseModel):
     description: str | None = None
     cases: float | None = None
     weight: float | None = None
+    # Source page (1-indexed) this line was extracted from. Lets the UI
+    # group lines by page and lets the cross-shipment filter route only
+    # primary-shipment lines into the rubric.
+    page_number: int | None = None
+    # False when the line came from a page whose header (BOL #, ship-to,
+    # PO) disagrees with the primary shipment's header. Such lines are
+    # surfaced in the UI with a "different shipment" flag but excluded
+    # from matching / decision math.
+    belongs_to_primary_shipment: bool = True
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -177,6 +186,15 @@ class BillOfLading(BaseDocument):
     total_cases: float | None = None
     receiving: ReceivingEvidence | None = None
     content_belongs_to_different_shipment: bool = False
+    # Page-level breakdown of cross-shipment detection. Page 1's header
+    # (BOL number, ship-to, PO number) is treated as the primary
+    # shipment; pages whose header disagrees end up in
+    # `cross_shipment_pages` with their own header in
+    # `cross_shipment_details`. The UI uses these to render flagged
+    # lines under their own page banner.
+    primary_shipment_pages: list[int] = Field(default_factory=list)
+    cross_shipment_pages: list[int] = Field(default_factory=list)
+    cross_shipment_details: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ProofOfDelivery(BaseDocument):

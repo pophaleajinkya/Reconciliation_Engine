@@ -1462,7 +1462,133 @@ def render_report(result: dict) -> None:
                     f"path · {_esc(doc.source_path)}</div>",
                     unsafe_allow_html=True,
                 )
+                if label == "BOL":
+                    render_bol_lines_table(doc)
                 st.json(doc.model_dump())
+
+
+def render_bol_lines_table(bol) -> None:
+    """
+    Render BOL line items grouped by source page. Lines from a page that
+    disagrees with page 1's header (different shipment) are visually
+    distinguished and labeled — they are extracted for transparency but
+    excluded from matching / decision math.
+    """
+    if bol is None or not getattr(bol, "lines", None):
+        return
+
+    cross_pages = set(getattr(bol, "cross_shipment_pages", []) or [])
+    cross_details = {
+        d.get("page_number"): d
+        for d in (getattr(bol, "cross_shipment_details", []) or [])
+        if isinstance(d, dict)
+    }
+
+    pages_in_order: list[int] = []
+    seen: set[int] = set()
+    for ln in bol.lines:
+        pn = ln.page_number if ln.page_number is not None else 1
+        if pn not in seen:
+            seen.add(pn)
+            pages_in_order.append(pn)
+
+    if getattr(bol, "content_belongs_to_different_shipment", False):
+        cross_list = sorted(cross_pages)
+        st.markdown(
+            "<div style='background:rgba(245,158,11,0.10);"
+            "border:1px solid rgba(245,158,11,0.45);"
+            "border-radius:10px;padding:10px 14px;margin:6px 0 14px;"
+            "color:#fbbf24;font-size:12px;'>"
+            "<strong>Cross-shipment content detected.</strong> "
+            f"Page(s) {cross_list} carry a different BOL/PO/ship-to than "
+            "page 1. Their lines are shown below for transparency but are "
+            "<u>excluded</u> from the reconciliation rubric."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+    for pn in pages_in_order:
+        page_lines = [ln for ln in bol.lines if (ln.page_number or 1) == pn]
+        is_cross = pn in cross_pages
+        title = f"Page {pn}"
+        if is_cross:
+            detail = cross_details.get(pn) or {}
+            extras = []
+            for k in ("bol_number", "po_number", "ship_to"):
+                v = detail.get(k)
+                if v:
+                    extras.append(f"{k.replace('_', ' ')}: {v}")
+            extras_html = (
+                f"<span style='font-size:11px;color:#fbbf24;margin-left:10px;"
+                f"font-weight:500;'>↪ different shipment</span>"
+                + (
+                    f"<span style='font-size:11px;color:#9ca3af;margin-left:10px;'>"
+                    f"({_esc(' · '.join(extras))})</span>"
+                    if extras
+                    else ""
+                )
+            )
+        else:
+            extras_html = (
+                "<span style='font-size:11px;color:#9ca3af;margin-left:10px;'>"
+                "primary shipment</span>"
+            )
+        st.markdown(
+            f"<div style='margin-top:14px;margin-bottom:6px;"
+            f"font-size:12px;color:#cbd5e1;font-weight:600;'>"
+            f"{_esc(title)}{extras_html}</div>",
+            unsafe_allow_html=True,
+        )
+
+        bg = "rgba(245,158,11,0.06)" if is_cross else "rgba(255,255,255,0.02)"
+        border = "rgba(245,158,11,0.30)" if is_cross else "var(--border)"
+        rows_html = []
+        for ln in page_lines:
+            material = _esc(ln.material_number or "—")
+            sku = _esc(ln.customer_sku or "—")
+            desc = _esc(ln.description or "")
+            cases = "—" if ln.cases is None else f"{ln.cases:g}"
+            weight = "—" if ln.weight is None else f"{ln.weight:,.2f}"
+            row_style = (
+                "opacity:0.65;text-decoration:line-through;"
+                if is_cross
+                else ""
+            )
+            rows_html.append(
+                f"<tr style='{row_style}'>"
+                f"<td style='padding:6px 10px;font-family:\"JetBrains Mono\",monospace;"
+                f"font-size:11px;color:#e5e7eb;'>{material}</td>"
+                f"<td style='padding:6px 10px;font-family:\"JetBrains Mono\",monospace;"
+                f"font-size:11px;color:#e5e7eb;'>{sku}</td>"
+                f"<td style='padding:6px 10px;font-size:12px;color:#cbd5e1;'>{desc}</td>"
+                f"<td style='padding:6px 10px;font-size:12px;color:#cbd5e1;text-align:right;'>{cases}</td>"
+                f"<td style='padding:6px 10px;font-size:12px;color:#cbd5e1;text-align:right;'>{weight}</td>"
+                f"</tr>"
+            )
+        st.markdown(
+            "<table style='width:100%;border-collapse:collapse;"
+            f"background:{bg};border:1px solid {border};border-radius:8px;"
+            "overflow:hidden;'>"
+            "<thead><tr>"
+            "<th style='text-align:left;padding:6px 10px;font-size:10px;"
+            "text-transform:uppercase;letter-spacing:0.10em;color:#9ca3af;"
+            "border-bottom:1px solid var(--border);'>Material</th>"
+            "<th style='text-align:left;padding:6px 10px;font-size:10px;"
+            "text-transform:uppercase;letter-spacing:0.10em;color:#9ca3af;"
+            "border-bottom:1px solid var(--border);'>SKU</th>"
+            "<th style='text-align:left;padding:6px 10px;font-size:10px;"
+            "text-transform:uppercase;letter-spacing:0.10em;color:#9ca3af;"
+            "border-bottom:1px solid var(--border);'>Description</th>"
+            "<th style='text-align:right;padding:6px 10px;font-size:10px;"
+            "text-transform:uppercase;letter-spacing:0.10em;color:#9ca3af;"
+            "border-bottom:1px solid var(--border);'>Cases</th>"
+            "<th style='text-align:right;padding:6px 10px;font-size:10px;"
+            "text-transform:uppercase;letter-spacing:0.10em;color:#9ca3af;"
+            "border-bottom:1px solid var(--border);'>Weight</th>"
+            "</tr></thead>"
+            f"<tbody>{''.join(rows_html)}</tbody></table>",
+            unsafe_allow_html=True,
+        )
 
 
 def render_empty_state() -> None:

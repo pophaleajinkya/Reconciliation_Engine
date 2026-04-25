@@ -121,6 +121,11 @@ def _find_bol_lines(
     mat = invoice_line.material_number if invoice_line else None
     hits: list[ShippedLine] = []
     for ln in bol.lines:
+        # Lines extracted from a different-shipment page are kept on the
+        # BOL document for UI transparency, but must NOT influence
+        # matching / qty-received math for this case.
+        if not ln.belongs_to_primary_shipment:
+            continue
         if mat and ln.material_number and ln.material_number == mat:
             hits.append(ln)
         elif _upc_suffix_matches_material(claim.upc, ln.material_number) is not None:
