@@ -66,6 +66,67 @@ Every extractor runs through the same three tiers automatically:
 
 The `extraction_method` field on each document tells you which tier fired (`text_deterministic`, `ocr_deterministic`, `text_llm`, or `vision_llm`).
 
+### How the three models actually work (and why we layer them)
+
+A common point of confusion: "Llama 4 Scout is a vision + language model,
+so the vision part must produce text that the language part then reasons
+over." That mental model is intuitive but **not** how modern multimodal
+LLMs work. Each tier in our ladder uses a fundamentally different
+architecture, and the ladder exists precisely because each one fails
+differently. Worth being precise about, since it shapes every guard in
+the pipeline.
+
+**1. Surya (Tier 2) — specialist OCR pipeline, *not* an LLM.**
+Surya is a stack of small purpose-built models: layout detector → line
+detector → text recogniser. It transcribes pixels into characters with
+per-line bounding boxes and confidence scores. It has no language model,
+no reasoning, and no notion of "what the document means." It cannot
+invent words — at worst it returns garbled characters with low
+confidence. We use it as the honest middle tier: when `pdfplumber`
+returns nothing, we'd rather have noisy-but-truthful transcription than
+smooth-but-fabricated narrative.
+
+**2. Llama 3.3-70B (text extraction) — text-only LLM.**
+This is the model we use to coerce extracted text into structured JSON
+(invoice lines, claim lines, remittance entries). It is **text-only**;
+it never sees images. It can hallucinate fields that aren't present in
+the input text, which is why every text-LLM call goes through a
+JSON-mode prompt with explicit "use null when uncertain, never invent
+values" instructions, and why we always run regex first and only fall
+back to the LLM when regex returns zero rows.
+
+**3. Llama 4 Scout / Claude Sonnet 4.5 (Tier 3) — natively multimodal LLM.**
+These are end-to-end vision-language models. There is **no internal
+"OCR step then LLM step"** — the vision encoder turns pixels into
+embeddings, the text tokenizer turns words into embeddings, and a
+single transformer reasons over both streams simultaneously. The
+practical consequence: the model can read handwriting and odd layouts
+brilliantly, *and* it can confidently invent numbers from ambiguous
+pixels because there's no intermediate text representation we can
+verify. (We saw this in practice: Sonnet misread the `1425 / 1425`
+Kroger stamp on Package 1 as `286 / 142` — fluent, confident, wrong.)
+This is exactly why the rubric never trusts a single VLM call: every
+vision output passes through plausibility guards (e.g. case counts
+greater than 20 000 are dropped as PRO-number leakage) and falls back
+to a deterministic narrative-pattern check (`Over/Short: 0`) when
+numeric fields come back partial.
+
+**The trust ladder, in one line each:**
+
+| Tool | What it promises | What it never does |
+| --- | --- | --- |
+| `pdfplumber` (Tier 1) | Bytes-faithful text from the PDF text layer | Hallucinate — it's deterministic |
+| Surya (Tier 2) | Transcribe pixels with confidence + bboxes | Generate or interpret |
+| Llama 3.3-70B (text) | Coerce clean text into JSON shape | See images |
+| Llama 4 Scout / Sonnet (Tier 3) | Read handwriting, signatures, weird layouts | Refuse to guess when pixels are ambiguous |
+| Deterministic rubric | Decide VALID/INVALID/REVIEW from structured fields | Talk to any LLM in the decision path |
+
+The rubric itself is the reason all of this is auditable: **no LLM
+output ever reaches the verdict directly.** Every number that drives a
+decision is either deterministic or has been through a plausibility
+filter, and every reasoning step in the trace cites the document,
+field, and tier that produced it.
+
 ---
 
 ## Setup
