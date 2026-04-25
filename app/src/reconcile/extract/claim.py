@@ -4,8 +4,14 @@ Deduction claim extractor.
 Strategy:
   1. Deterministic text parse of the "Associated Deductions" table if present
      (Kroger/PRGX format produces readable text on the clean page).
-  2. If text extraction returns nothing (e.g. package 2's garbled first page),
-     fall back to vision extraction over all page images.
+  2. If "Associated Deductions" is empty / "No results" but the doc carries
+     an "Associated Promotions" billback (e.g. an ORAD-late / OTIF /
+     compliance penalty), synthesize a single claim line from the
+     promotion row so the downstream classifier+dispatcher can route it
+     to NEEDS_HUMAN_REVIEW with a compliance-rubric explanation.
+  3. If the deterministic pass still finds nothing (e.g. package 2's
+     garbled first page), retry over Surya OCR.
+  4. Final fallback: vision LLM over all page images.
 """
 
 from __future__ import annotations
@@ -28,7 +34,13 @@ log = logging.getLogger("reconcile.extract.claim")
 
 _INVOICE_RE = re.compile(r"KROGER\s+Invoice\s+number:\s*(\d+)", re.I)
 _INV_HEADER_ALT_RE = re.compile(r"Invoice\s+number\s+(\d{7,})", re.I)
-_PO_RE = re.compile(r"PO\s+Number\s+(\S+)", re.I)
+# Header PO row: must be followed by an actual PO number (digits, sometimes
+# with a separator). Plain "PO Number\nPayment Details" — common when the
+# header PO is blank because the claim is shipment-level (e.g. an OTIF/ORAD
+# billback) — must NOT be captured.
+_PO_RE = re.compile(r"PO\s+Number\s+(\d[\d\-]{2,})\b", re.I)
+# Narrative fallback: `PO Num: 21371` inside a promotions row.
+_PO_NARRATIVE_RE = re.compile(r"PO\s*Num(?:ber)?\s*[:#]?\s*(\d[\d\-]{2,})", re.I)
 _DEDUCTION_AMT_RE = re.compile(r"Deduction amount\s*\(\s*-\s*\)\s*\$\s*([\d,]+\.\d{2})", re.I)
 _GROSS_AMT_RE = re.compile(r"Gross invoice amount\s*\(\s*\+\s*\)\s*\$\s*([\d,]+\.\d{2})", re.I)
 _NET_AMT_RE = re.compile(r"Net invoice amount\s*\(\s*\+\s*\)\s*\$\s*([\d,]+\.\d{2})", re.I)
@@ -47,6 +59,112 @@ _REASON_TEXT_RE = re.compile(
     re.I,
 )
 _CODE_AFTER_UNIT_RE = re.compile(r"\$\s*[\d,]+\.\d{2}\s+(\d{1,2})\b")
+
+
+# ---------------------------------------------------------------------------
+# "Associated Promotions" billback parser.
+#
+# The Kroger/PRGX deduction-invoice template has TWO tables that can carry a
+# claim row:
+#   - "Associated Deductions" — goods-level chargebacks (shortage, pricing,
+#     unsaleables). UPC + Adj Qty + Adj Amt per line.
+#   - "Associated Promotions" — shipment-level billbacks (OTIF / ORAD-late /
+#     promo-allowance / coupon handling). No UPC; the row keys on a Bill
+#     Amount and a free-text description like "PEYTONS ORAD LATE; ...".
+#
+# When the Deductions table is empty ("No results") but the Promotions
+# table carries a $-amount, the document is still a legitimate claim — it's
+# just a non-shortage rubric. We synthesize a single ClaimLine so the
+# classifier + dispatcher can recognize it as COMPLIANCE and route to
+# human review with the OTIF / late-delivery message.
+# ---------------------------------------------------------------------------
+
+_PROMO_SECTION_START_RE = re.compile(r"\bAssociated\s+Promotions\b", re.I)
+_DEDUCTION_NO_RESULTS_RE = re.compile(
+    r"Associated\s+Deductions\b.*?\bNo\s+results\b",
+    re.I | re.DOTALL,
+)
+# A promotion row is recognized by: (a) two consecutive `$ amount` tokens
+# (Bill Amount + Accrued Amount, often equal) and (b) a narrative we can
+# trust as a compliance-family signal in the same window.
+_PROMO_AMT_PAIR_RE = re.compile(
+    r"\$\s*([\d,]+\.\d{2})\s+\$\s*([\d,]+\.\d{2})"
+)
+_PROMO_COMPLIANCE_NARRATIVE_RE = re.compile(
+    r"(orad\s*(?:late|date)|on[\s-]?time\s+in[\s-]?full|otif|"
+    r"late\s+delivery|missed\s+appointment|routing\s+violation|"
+    r"asn\s+(?:fail|error)|edi\s+(?:fail|error)|compliance\s+fee)",
+    re.I,
+)
+
+
+def _parse_promotion_row(text: str) -> ClaimLine | None:
+    """
+    Look for an OTIF / ORAD-late / compliance billback in the
+    'Associated Promotions' section. Returns a synthesized ClaimLine
+    with the promo $ amount and a narrative string the classifier
+    will tag as COMPLIANCE, or None if no compliance promotion row
+    is present.
+
+    Intentionally conservative: only fires when narrative confirms a
+    compliance signal. We never silently relabel an arbitrary promo
+    row (e.g. a coupon-handling fee) as a deduction we know how to
+    handle — the analyst sees the full narrative in `reason_text`.
+    """
+    section_m = _PROMO_SECTION_START_RE.search(text)
+    if not section_m:
+        return None
+
+    # Window from the section header to the end of the doc; promotions
+    # tables are usually at the bottom of page 2.
+    window = text[section_m.start():]
+
+    narrative_m = _PROMO_COMPLIANCE_NARRATIVE_RE.search(window)
+    if not narrative_m:
+        return None
+
+    # Pull the $ pair closest (in text distance) to the narrative line so
+    # we don't grab a header total.
+    nstart = narrative_m.start()
+    candidates: list[tuple[int, float, float]] = []
+    for am in _PROMO_AMT_PAIR_RE.finditer(window):
+        amt1 = float(am.group(1).replace(",", ""))
+        amt2 = float(am.group(2).replace(",", ""))
+        candidates.append((abs(am.start() - nstart), amt1, amt2))
+    if not candidates:
+        return None
+    candidates.sort()
+    _, bill_amt, accrued_amt = candidates[0]
+
+    # Use the Bill Amount as the canonical claimed amount; if the two
+    # disagree, the larger is usually the Bill Amount and the smaller
+    # the Accrued (already-paid) amount, but for routing-to-human all
+    # we need is *some* dollar value.
+    claimed = bill_amt or accrued_amt
+    if not claimed:
+        return None
+
+    # Build a clean narrative for the classifier. We start from the
+    # narrative line itself (back to the previous newline) so column
+    # headers leaking in from upstream lines don't pollute the
+    # `reason_text` we surface in the UI / report.
+    line_start = window.rfind("\n", 0, nstart) + 1
+    line_end = window.find("\n", narrative_m.end())
+    if line_end == -1:
+        line_end = len(window)
+    narrative_snippet = re.sub(
+        r"\s+", " ", window[line_start:line_end].strip()
+    )
+
+    return ClaimLine(
+        upc=None,  # Promo rows are shipment-level, not SKU-level.
+        description=None,
+        adj_qty=None,
+        unit_price=None,
+        adj_amount=-abs(claimed),  # Deductions are negative dollars.
+        reason_code=None,  # No numeric Kroger code on promo rows.
+        reason_text=narrative_snippet,
+    )
 
 
 def _parse_deduction_rows(text: str) -> list[ClaimLine]:
@@ -137,19 +255,38 @@ def _text_parse(rendered: RenderedPDF) -> DeductionClaim | None:
         return None
 
     inv_m = _INVOICE_RE.search(text) or _INV_HEADER_ALT_RE.search(text)
-    po_m = _PO_RE.search(text)
+    po_m = _PO_RE.search(text) or _PO_NARRATIVE_RE.search(text)
     ded_m = _DEDUCTION_AMT_RE.search(text)
     gross_m = _GROSS_AMT_RE.search(text)
     net_m = _NET_AMT_RE.search(text)
     disc_m = _DISC_AMT_RE.search(text)
 
     claim_lines = _parse_deduction_rows(text)
+    warnings: list[str] = []
+
+    # When the Deductions table is empty / "No results", check the
+    # Associated Promotions table for a compliance-style billback
+    # (ORAD-late, OTIF, routing). The synthesized line keeps the
+    # narrative in `reason_text` so the classifier tags it as
+    # COMPLIANCE and the dispatcher routes to NEEDS_HUMAN_REVIEW.
+    if not claim_lines:
+        deductions_empty = _DEDUCTION_NO_RESULTS_RE.search(text) is not None
+        promo_line = _parse_promotion_row(text)
+        if promo_line is not None:
+            claim_lines = [promo_line]
+            warnings.append(
+                "Associated Deductions table is empty; claim line synthesized "
+                "from Associated Promotions row (compliance / billback)."
+                if deductions_empty
+                else "Associated Promotions billback detected alongside an "
+                     "empty Deductions parse; synthesized as a compliance line."
+            )
+
     if not claim_lines:
         return None
 
     # Fallback: if exactly one claim line is missing its amount and the header
     # shows a single deduction amount, adopt it (with a warning).
-    warnings: list[str] = []
     if (
         len(claim_lines) == 1
         and claim_lines[0].adj_amount is None
@@ -163,6 +300,14 @@ def _text_parse(rendered: RenderedPDF) -> DeductionClaim | None:
                 "(pdfplumber interleaved the inline amount)"
             )
 
+    # When the only line is a synthesized promotion row but the header
+    # doesn't carry a `Deduction amount` (because the billback lives in
+    # the Promotions table on these docs), surface the line amount as
+    # the doc-level deduction so the UI / report match.
+    deduction_amount = parse_amount(ded_m.group(0)) if ded_m else None
+    if not deduction_amount and len(claim_lines) == 1 and claim_lines[0].adj_amount:
+        deduction_amount = claim_lines[0].adj_amount
+
     return DeductionClaim(
         source_path=str(rendered.source_path),
         pages=len(rendered.pages),
@@ -170,7 +315,7 @@ def _text_parse(rendered: RenderedPDF) -> DeductionClaim | None:
         extraction_confidence=0.9,
         invoice_number=inv_m.group(1) if inv_m else None,
         po_number=po_m.group(1) if po_m else None,
-        deduction_amount=parse_amount(ded_m.group(0)) if ded_m else None,
+        deduction_amount=deduction_amount,
         gross_invoice_amount=parse_amount(gross_m.group(0)) if gross_m else None,
         net_invoice_amount=parse_amount(net_m.group(0)) if net_m else None,
         discount_amount=parse_amount(disc_m.group(0)) if disc_m else None,
