@@ -56,6 +56,49 @@ case folder (PDFs)
 | Shortage decision | **Deterministic math + rules** | LLMs are bad at arithmetic. Verdicts are derived, not generated. |
 | Narrative trace | Deterministic builder | Every reasoning step is tied to a fact we extracted. |
 
+### Architecture classification — Workflow, not Agent
+
+It's worth being precise here because the labels matter for governance,
+and "agent" gets thrown around as a buzzword.
+
+**This system is a deterministic *workflow*, not an autonomous agent,
+not RAG, and not an MCP agent.** Specifically, by [Anthropic's
+taxonomy](https://www.anthropic.com/research/building-effective-agents)
+it combines two named workflow patterns: **Routing** (the
+native-text → Surya OCR → vision-LLM ladder, where the routing
+decision is deterministic, not model-driven) and **Prompt Chaining**
+(sequential LLM calls inside each extractor).
+
+Why those other labels don't apply:
+
+| Pattern | What defines it | Why this isn't that |
+| --- | --- | --- |
+| **RAG** | A retriever pulls top-k passages from a corpus; the LLM *generates* the answer from them | No retriever, no corpus, no generated verdict. The case bundle *is* the input — there's nothing to retrieve. |
+| **MCP / autonomous agent** | LLM decides which tool to call next in a planning loop | Pipeline order is fixed in code (ingest → extract → match → decide → report). The LLM never picks the next step. |
+| **ML pipeline** | A model outputs the final classification | The verdict comes from a rule-based rubric. No model is in the decision path. |
+
+**Why we chose Workflow over Agent:** for a finance-compliance use
+case, *"the LLM decided X"* is not an answer a CFO will accept.
+*"The rule said X because the BOL stamp said `Over/Short: 0` and the
+math (`66 × $30.72 = $2,027.52`) verified the claim allocation"* is.
+Workflows give predictable cost, reproducible verdicts, and a
+line-by-line audit trail. Agents give flexibility we don't need —
+the steps are already known.
+
+**The architecture is agent-ready, though.** Each extractor is a
+typed function with a schema (`RenderedPDF → BaseDocument`); the
+deterministic orchestrator could be swapped for an agent loop, or the
+extractors exposed as MCP tools to a third-party agent, without
+changing the extractor implementations themselves. We chose not to
+today — the seams are clean if that ever changes.
+
+The only place an LLM is allowed to "speak" is the post-decision
+analyst memo in the experimental `app2/` branch. It runs strictly
+*after* the verdict is sealed, is decision-aware (different prompts
+for VALID / INVALID / NEEDS_HUMAN_REVIEW), and cannot alter the
+decision — separating the deterministic verdict from its
+human-readable explanation.
+
 ### Extraction fallback ladder
 
 Every extractor runs through the same three tiers automatically:
