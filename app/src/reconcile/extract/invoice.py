@@ -18,6 +18,7 @@ import logging
 import re
 
 from reconcile.extract.base import parse_amount
+from reconcile.extract.invoice_edi import looks_like_edi_invoic, parse_edi_invoic
 from reconcile.ingest.renderer import RenderedPDF
 from reconcile.llm.groq_client import extract_json_from_text
 from reconcile.schemas import (
@@ -156,6 +157,24 @@ def _llm_fallback(rendered: RenderedPDF) -> SalesInvoice:
 
 def extract_sales_invoice(rendered: RenderedPDF) -> SalesInvoice:
     text = rendered.full_text
+
+    # Tier 0: SAP EDI INVOIC02 (IDoc XML). Some retailers send the
+    # invoice as a structured `.txt` IDoc rather than a PDF. The IDoc
+    # segments are unambiguous, so when we detect the envelope we parse
+    # it directly and bypass the PDF regex/OCR/LLM tiers entirely.
+    if looks_like_edi_invoic(text):
+        edi_invoice = parse_edi_invoic(text, source_path=rendered.source_path)
+        if edi_invoice and edi_invoice.lines:
+            log.info(
+                "Invoice parsed as EDI INVOIC IDoc (%d lines).",
+                len(edi_invoice.lines),
+            )
+            return edi_invoice
+        log.info(
+            "EDI INVOIC envelope detected but parse yielded no lines; "
+            "falling back to PDF tiers."
+        )
+
     hdr = _parse_header(text)
     lines = _parse_lines(text)
 
