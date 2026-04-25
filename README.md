@@ -70,6 +70,8 @@ The `extraction_method` field on each document tells you which tier fired (`text
 
 ## Setup
 
+All Python code lives under `app/`. From the repo root:
+
 ```bash
 cd app
 python3 -m venv .venv
@@ -77,8 +79,12 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# edit .env — set GROQ_API_KEY
+# edit .env — set OPENROUTER_API_KEY (or GROQ_API_KEY)
 ```
+
+> The Curta case bundles are not committed to this repo (they're
+> Curta-confidential). To run end-to-end, place the case folders at any
+> path on disk and pass that path to the CLI / UI.
 
 Models used (overridable via env):
 
@@ -93,10 +99,10 @@ Models used (overridable via env):
 
 ```bash
 cd app
-PYTHONPATH=src python -m reconcile \
-    "../Curta Take Home Challenge/package 1" \
-    "../Curta Take Home Challenge/package 2" \
-    -v
+PYTHONPATH=src python -m reconcile /path/to/case_folder -v
+
+# Multiple cases at once:
+PYTHONPATH=src python -m reconcile /path/to/case_1 /path/to/case_2 -v
 ```
 
 Artifacts are written to `app/output/<case_name>/`:
