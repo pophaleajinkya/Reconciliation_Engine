@@ -29,6 +29,7 @@ import html
 import sys
 import textwrap
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
@@ -621,6 +622,95 @@ details.raw-doc[open] summary { color: var(--text-0); margin-bottom: 8px; }
 }
 .empty-hero .big { color: var(--text-0); font-size: 18px; font-weight: 600; margin-bottom: 6px; }
 .empty-hero .sub { color: var(--text-2); font-size: 13px; }
+
+/* ----------------------------- Debug doc tables ----------------------------
+ * Used by the "raw extracted documents" expander to render each doc's
+ * structured contents as a clean table instead of a JSON blob.
+ * --------------------------------------------------------------------- */
+.dbg-meta {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: var(--text-2); margin: 0 0 10px 0;
+    display: flex; flex-wrap: wrap; gap: 14px; row-gap: 4px;
+}
+.dbg-meta .k { color: var(--text-3); margin-right: 6px; }
+.dbg-meta .v { color: var(--text-1); }
+.dbg-section {
+    margin: 12px 0 4px 0;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em;
+    color: var(--text-3); font-weight: 700;
+}
+.dbg-kv {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 8px 14px;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin-bottom: 10px;
+}
+.dbg-kv .row { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.dbg-kv .row .k {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.10em;
+    color: var(--text-3);
+}
+.dbg-kv .row .v {
+    font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-0);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dbg-kv .row .v.muted { color: var(--text-3); }
+.dbg-table {
+    width: 100%; border-collapse: collapse; margin: 4px 0 12px 0;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+}
+.dbg-table th {
+    text-align: left; padding: 7px 10px; font-size: 10px;
+    text-transform: uppercase; letter-spacing: 0.10em; color: var(--text-3);
+    border-bottom: 1px solid var(--border); background: rgba(255,255,255,0.02);
+    font-weight: 600;
+}
+.dbg-table td {
+    padding: 6px 10px; font-size: 12px; color: var(--text-1);
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    vertical-align: top;
+}
+.dbg-table tr:last-child td { border-bottom: none; }
+.dbg-table td.mono { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-0); }
+.dbg-table td.num  { font-family: 'JetBrains Mono', monospace; font-size: 11px; text-align: right; color: var(--text-0); }
+.dbg-table td.neg  { color: #fca5a5; }
+.dbg-table td.muted { color: var(--text-3); }
+.dbg-table tr.cross td { opacity: 0.65; text-decoration: line-through; }
+.dbg-pill {
+    display: inline-block; padding: 1px 8px; border-radius: 999px;
+    font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    border: 1px solid var(--border); color: var(--text-2);
+    background: rgba(255,255,255,0.03);
+}
+.dbg-pill.warn { color: #fbbf24; border-color: rgba(245,158,11,0.45); background: rgba(245,158,11,0.08); }
+.dbg-pill.ok   { color: var(--green-soft); border-color: rgba(34,197,94,0.30); background: rgba(34,197,94,0.06); }
+.dbg-pill.info { color: var(--cyan); border-color: rgba(34,211,238,0.30); background: rgba(34,211,238,0.06); }
+.dbg-banner {
+    border-radius: 10px; padding: 10px 14px; margin: 6px 0 14px 0;
+    font-size: 12px;
+}
+.dbg-banner.warn {
+    background: rgba(245,158,11,0.10);
+    border: 1px solid rgba(245,158,11,0.45);
+    color: #fbbf24;
+}
+.dbg-page-title {
+    margin: 14px 0 6px 0; font-size: 12px; color: var(--text-1); font-weight: 600;
+}
+.dbg-page-title .tag-cross {
+    font-size: 11px; color: #fbbf24; margin-left: 10px; font-weight: 500;
+}
+.dbg-page-title .tag-primary {
+    font-size: 11px; color: var(--text-3); margin-left: 10px; font-weight: 500;
+}
+.dbg-page-title .tag-meta {
+    font-size: 11px; color: var(--text-3); margin-left: 10px;
+}
 </style>
 """
 
@@ -1441,154 +1531,487 @@ def render_report(result: dict) -> None:
         render_stamp_card(matched)
         render_audit_rail(report, matched)
 
-    # Debug expander at the bottom
+    # Debug expander at the bottom — every document rendered as clean
+    # tables, with raw JSON tucked behind a nested expander per tab.
     with st.expander("Debug · raw extracted documents", expanded=False):
         tab_labels = ["Invoice", "BOL", "POD", "Remittance", "Claim"]
         tabs = st.tabs(tab_labels)
-        for tab, doc, label in zip(
-            tabs,
-            [matched.invoice, matched.bol, matched.pod, matched.remittance, matched.claim],
-            tab_labels,
-        ):
+        docs = [
+            matched.invoice,
+            matched.bol,
+            matched.pod,
+            matched.remittance,
+            matched.claim,
+        ]
+        for tab, doc, label in zip(tabs, docs, tab_labels):
             with tab:
-                if doc is None:
-                    st.caption(f"No {label.lower()} document in this bundle.")
-                    continue
-                st.markdown(
-                    f"<div style='font-family:\"JetBrains Mono\",monospace;font-size:11px;"
-                    f"color:#9ca3af;margin-bottom:8px;'>"
-                    f"method · {_esc(doc.extraction_method.value)} · "
-                    f"confidence {doc.extraction_confidence:.2f}<br/>"
-                    f"path · {_esc(doc.source_path)}</div>",
-                    unsafe_allow_html=True,
-                )
-                if label == "BOL":
-                    render_bol_lines_table(doc)
-                st.json(doc.model_dump())
+                render_doc_debug(label, doc)
 
 
-def render_bol_lines_table(bol) -> None:
+# =============================================================================
+# Debug · tabular renderers
+# =============================================================================
+#
+# The "Debug · raw extracted documents" expander used to dump each
+# document as a JSON blob (`st.json`). That worked for sanity-checking
+# but was hostile to skim during a live walkthrough — the structured
+# fields that matter for reconciliation (line items, prices, stamp
+# numbers) were buried in 30+ keys per doc.
+#
+# These helpers render every extracted document as a small set of
+# coordinated tables: a header card (key/value), one or more item
+# tables (lines / receiving), and any supplementary structured fields.
+# Raw JSON stays available behind a nested "Show raw JSON" expander.
+
+
+def _fmt_num(v, fmt: str = "{:g}") -> str:
+    if v is None:
+        return "—"
+    try:
+        return fmt.format(float(v))
+    except (TypeError, ValueError):
+        return _esc(v)
+
+
+def _fmt_money(v) -> str:
+    if v is None:
+        return "—"
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return _esc(v)
+    sign = "-" if n < 0 else ""
+    return f"{sign}${abs(n):,.2f}"
+
+
+def _fmt_text(v, *, dash_when_empty: bool = True) -> str:
+    if v is None:
+        return "—" if dash_when_empty else ""
+    s = str(v).strip()
+    if not s:
+        return "—" if dash_when_empty else ""
+    return _esc(s)
+
+
+def _kv_grid(items: list[tuple[str, Any]]) -> None:
+    """Render a responsive key/value grid for document headers."""
+    rows: list[str] = []
+    for key, val in items:
+        if val is None or (isinstance(val, str) and not val.strip()):
+            v_html = "<div class='v muted'>—</div>"
+        elif isinstance(val, bool):
+            v_html = (
+                "<div class='v'>" + ("yes" if val else "no") + "</div>"
+            )
+        elif isinstance(val, (int, float)):
+            v_html = f"<div class='v'>{_esc(val)}</div>"
+        else:
+            v_html = f"<div class='v' title='{_esc(val)}'>{_esc(val)}</div>"
+        rows.append(
+            f"<div class='row'><div class='k'>{_esc(key)}</div>{v_html}</div>"
+        )
+    if not rows:
+        return
+    _html(f"<div class='dbg-kv'>{''.join(rows)}</div>")
+
+
+def _section(title: str) -> None:
+    _html(f"<div class='dbg-section'>{_esc(title)}</div>")
+
+
+def _table(
+    columns: list[tuple[str, str]],  # (label, css class for cells: "", "mono", "num")
+    rows: list[list[tuple[str, str]]],  # per-cell (text, extra-class)
+    *,
+    empty_msg: str = "No rows.",
+) -> None:
+    if not rows:
+        _html(f"<div class='dbg-meta'><span class='v muted'>{_esc(empty_msg)}</span></div>")
+        return
+    head = "".join(
+        f"<th style='text-align:{'right' if cls == 'num' else 'left'}'>{_esc(label)}</th>"
+        for label, cls in columns
+    )
+    body_rows: list[str] = []
+    for row in rows:
+        # row may be a list of (text, extra) cells, or the special form
+        # [("__row_class__", "cross"), ...cells]
+        row_cls = ""
+        cells = row
+        if cells and cells[0] and cells[0][0] == "__row_class__":
+            row_cls = cells[0][1]
+            cells = cells[1:]
+        cell_html = []
+        for (text, extra), (_, base_cls) in zip(cells, columns):
+            classes = " ".join(c for c in (base_cls, extra) if c)
+            cell_html.append(
+                f"<td class='{classes}'>{text}</td>" if classes else f"<td>{text}</td>"
+            )
+        body_rows.append(
+            f"<tr class='{row_cls}'>{''.join(cell_html)}</tr>" if row_cls
+            else f"<tr>{''.join(cell_html)}</tr>"
+        )
+    _html(
+        "<table class='dbg-table'>"
+        f"<thead><tr>{head}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+    )
+
+
+def _render_doc_meta(doc) -> None:
+    """One-line metadata strip at the top of each debug tab."""
+    method = _esc(doc.extraction_method.value)
+    conf = doc.extraction_confidence
+    pages = getattr(doc, "pages", None)
+    src = Path(doc.source_path).name
+    parse_warnings = getattr(doc, "parse_warnings", None) or []
+    pieces = [
+        f"<span><span class='k'>method</span><span class='v'>{method}</span></span>",
+        f"<span><span class='k'>confidence</span><span class='v'>{conf:.2f}</span></span>",
+    ]
+    if pages:
+        pieces.append(
+            f"<span><span class='k'>pages</span><span class='v'>{pages}</span></span>"
+        )
+    pieces.append(
+        f"<span><span class='k'>file</span><span class='v' title='{_esc(doc.source_path)}'>"
+        f"{_esc(src)}</span></span>"
+    )
+    _html(f"<div class='dbg-meta'>{''.join(pieces)}</div>")
+    if parse_warnings:
+        items = "<br/>• ".join(_esc(w) for w in parse_warnings)
+        _html(
+            f"<div class='dbg-banner warn'><strong>Parse notes</strong><br/>• {items}</div>"
+        )
+
+
+# ----------------------------- Invoice ----------------------------------------
+
+
+def render_invoice_debug(inv) -> None:
+    if inv is None:
+        return
+    _section("Header")
+    _kv_grid([
+        ("Invoice #", inv.invoice_number),
+        ("Invoice date", inv.invoice_date),
+        ("PO #", inv.po_number),
+        ("Delivery #", inv.delivery_number),
+        ("Carrier", inv.carrier),
+        ("Terms", inv.terms_of_payment),
+        ("Bill to", inv.bill_to),
+        ("Ship to", inv.ship_to),
+        ("Subtotal", _fmt_money(inv.subtotal)),
+        ("Total", _fmt_money(inv.total_amount)),
+    ])
+
+    _section(f"Line items ({len(inv.lines)})")
+    cols = [
+        ("#", "mono"),
+        ("Material", "mono"),
+        ("Description", ""),
+        ("Qty", "num"),
+        ("UoM", "mono"),
+        ("Unit $", "num"),
+        ("Promo $", "num"),
+        ("Net unit $", "num"),
+        ("Gross $", "num"),
+    ]
+    rows: list[list[tuple[str, str]]] = []
+    for ln in inv.lines:
+        promo = ln.off_invoice_promo
+        promo_cls = "neg" if (promo is not None and promo < 0) else ""
+        rows.append([
+            (_fmt_text(ln.line_no), ""),
+            (_fmt_text(ln.material_number), ""),
+            (_fmt_text(ln.description), ""),
+            (_fmt_num(ln.quantity), ""),
+            (_fmt_text(ln.unit_label), ""),
+            (_fmt_money(ln.unit_price), ""),
+            (_fmt_money(promo), promo_cls),
+            (_fmt_money(ln.net_unit_price), ""),
+            (_fmt_money(ln.gross_value), ""),
+        ])
+    _table(cols, rows, empty_msg="No invoice lines extracted.")
+
+
+# ----------------------------- BOL --------------------------------------------
+
+
+def render_bol_debug(bol) -> None:
     """
-    Render BOL line items grouped by source page. Lines from a page that
-    disagrees with page 1's header (different shipment) are visually
-    distinguished and labeled — they are extracted for transparency but
-    excluded from matching / decision math.
+    Render a BOL document as: header card + per-page line tables (with
+    cross-shipment lines visually flagged) + receiving evidence table.
     """
-    if bol is None or not getattr(bol, "lines", None):
+    if bol is None:
         return
 
-    cross_pages = set(getattr(bol, "cross_shipment_pages", []) or [])
+    _section("Header")
+    _kv_grid([
+        ("BOL #", bol.bol_number),
+        ("PRO #", bol.pro_number),
+        ("PO #", bol.po_number),
+        ("Ship date", bol.ship_date),
+        ("Carrier", bol.carrier),
+        ("Ship to", bol.ship_to),
+        ("Total cases", _fmt_num(bol.total_cases)),
+        ("Pages (primary)", ", ".join(map(str, bol.primary_shipment_pages or [])) or "—"),
+        ("Pages (cross-ship)", ", ".join(map(str, bol.cross_shipment_pages or [])) or "—"),
+    ])
+
+    cross_pages = set(bol.cross_shipment_pages or [])
     cross_details = {
         d.get("page_number"): d
-        for d in (getattr(bol, "cross_shipment_details", []) or [])
+        for d in (bol.cross_shipment_details or [])
         if isinstance(d, dict)
     }
 
-    pages_in_order: list[int] = []
-    seen: set[int] = set()
-    for ln in bol.lines:
-        pn = ln.page_number if ln.page_number is not None else 1
-        if pn not in seen:
-            seen.add(pn)
-            pages_in_order.append(pn)
-
-    if getattr(bol, "content_belongs_to_different_shipment", False):
+    if bol.content_belongs_to_different_shipment and cross_pages:
         cross_list = sorted(cross_pages)
-        st.markdown(
-            "<div style='background:rgba(245,158,11,0.10);"
-            "border:1px solid rgba(245,158,11,0.45);"
-            "border-radius:10px;padding:10px 14px;margin:6px 0 14px;"
-            "color:#fbbf24;font-size:12px;'>"
+        _html(
+            "<div class='dbg-banner warn'>"
             "<strong>Cross-shipment content detected.</strong> "
             f"Page(s) {cross_list} carry a different BOL/PO/ship-to than "
             "page 1. Their lines are shown below for transparency but are "
             "<u>excluded</u> from the reconciliation rubric."
-            "</div>",
-            unsafe_allow_html=True,
+            "</div>"
         )
 
-    for pn in pages_in_order:
-        page_lines = [ln for ln in bol.lines if (ln.page_number or 1) == pn]
-        is_cross = pn in cross_pages
-        title = f"Page {pn}"
-        if is_cross:
-            detail = cross_details.get(pn) or {}
-            extras = []
-            for k in ("bol_number", "po_number", "ship_to"):
-                v = detail.get(k)
-                if v:
-                    extras.append(f"{k.replace('_', ' ')}: {v}")
-            extras_html = (
-                f"<span style='font-size:11px;color:#fbbf24;margin-left:10px;"
-                f"font-weight:500;'>↪ different shipment</span>"
-                + (
-                    f"<span style='font-size:11px;color:#9ca3af;margin-left:10px;'>"
-                    f"({_esc(' · '.join(extras))})</span>"
-                    if extras
-                    else ""
+    if bol.lines:
+        _section(f"Line items ({len(bol.lines)})")
+
+        # Order pages in the order they first appear so we don't reshuffle.
+        pages_in_order: list[int] = []
+        seen: set[int] = set()
+        for ln in bol.lines:
+            pn = ln.page_number if ln.page_number is not None else 1
+            if pn not in seen:
+                seen.add(pn)
+                pages_in_order.append(pn)
+
+        cols = [
+            ("Material", "mono"),
+            ("SKU", "mono"),
+            ("Description", ""),
+            ("Cases", "num"),
+            ("Weight", "num"),
+        ]
+        for pn in pages_in_order:
+            page_lines = [ln for ln in bol.lines if (ln.page_number or 1) == pn]
+            is_cross = pn in cross_pages
+            if is_cross:
+                detail = cross_details.get(pn) or {}
+                meta_bits = []
+                for k in ("bol_number", "po_number", "ship_to"):
+                    v = detail.get(k)
+                    if v:
+                        meta_bits.append(f"{k.replace('_', ' ')}: {v}")
+                tag = "<span class='tag-cross'>↪ different shipment</span>"
+                meta = (
+                    f"<span class='tag-meta'>({_esc(' · '.join(meta_bits))})</span>"
+                    if meta_bits else ""
                 )
+            else:
+                tag = "<span class='tag-primary'>primary shipment</span>"
+                meta = ""
+            _html(
+                f"<div class='dbg-page-title'>Page {pn}{tag}{meta}</div>"
             )
-        else:
-            extras_html = (
-                "<span style='font-size:11px;color:#9ca3af;margin-left:10px;'>"
-                "primary shipment</span>"
-            )
-        st.markdown(
-            f"<div style='margin-top:14px;margin-bottom:6px;"
-            f"font-size:12px;color:#cbd5e1;font-weight:600;'>"
-            f"{_esc(title)}{extras_html}</div>",
-            unsafe_allow_html=True,
-        )
+            rows = []
+            for ln in page_lines:
+                row: list[tuple[str, str]] = []
+                if is_cross:
+                    row.append(("__row_class__", "cross"))
+                row.extend([
+                    (_fmt_text(ln.material_number), ""),
+                    (_fmt_text(ln.customer_sku), ""),
+                    (_fmt_text(ln.description), ""),
+                    (_fmt_num(ln.cases), ""),
+                    (_fmt_num(ln.weight, "{:,.2f}"), ""),
+                ])
+                rows.append(row)
+            _table(cols, rows, empty_msg="No lines on this page.")
 
-        bg = "rgba(245,158,11,0.06)" if is_cross else "rgba(255,255,255,0.02)"
-        border = "rgba(245,158,11,0.30)" if is_cross else "var(--border)"
-        rows_html = []
-        for ln in page_lines:
-            material = _esc(ln.material_number or "—")
-            sku = _esc(ln.customer_sku or "—")
-            desc = _esc(ln.description or "")
-            cases = "—" if ln.cases is None else f"{ln.cases:g}"
-            weight = "—" if ln.weight is None else f"{ln.weight:,.2f}"
-            row_style = (
-                "opacity:0.65;text-decoration:line-through;"
-                if is_cross
-                else ""
-            )
-            rows_html.append(
-                f"<tr style='{row_style}'>"
-                f"<td style='padding:6px 10px;font-family:\"JetBrains Mono\",monospace;"
-                f"font-size:11px;color:#e5e7eb;'>{material}</td>"
-                f"<td style='padding:6px 10px;font-family:\"JetBrains Mono\",monospace;"
-                f"font-size:11px;color:#e5e7eb;'>{sku}</td>"
-                f"<td style='padding:6px 10px;font-size:12px;color:#cbd5e1;'>{desc}</td>"
-                f"<td style='padding:6px 10px;font-size:12px;color:#cbd5e1;text-align:right;'>{cases}</td>"
-                f"<td style='padding:6px 10px;font-size:12px;color:#cbd5e1;text-align:right;'>{weight}</td>"
-                f"</tr>"
-            )
-        st.markdown(
-            "<table style='width:100%;border-collapse:collapse;"
-            f"background:{bg};border:1px solid {border};border-radius:8px;"
-            "overflow:hidden;'>"
-            "<thead><tr>"
-            "<th style='text-align:left;padding:6px 10px;font-size:10px;"
-            "text-transform:uppercase;letter-spacing:0.10em;color:#9ca3af;"
-            "border-bottom:1px solid var(--border);'>Material</th>"
-            "<th style='text-align:left;padding:6px 10px;font-size:10px;"
-            "text-transform:uppercase;letter-spacing:0.10em;color:#9ca3af;"
-            "border-bottom:1px solid var(--border);'>SKU</th>"
-            "<th style='text-align:left;padding:6px 10px;font-size:10px;"
-            "text-transform:uppercase;letter-spacing:0.10em;color:#9ca3af;"
-            "border-bottom:1px solid var(--border);'>Description</th>"
-            "<th style='text-align:right;padding:6px 10px;font-size:10px;"
-            "text-transform:uppercase;letter-spacing:0.10em;color:#9ca3af;"
-            "border-bottom:1px solid var(--border);'>Cases</th>"
-            "<th style='text-align:right;padding:6px 10px;font-size:10px;"
-            "text-transform:uppercase;letter-spacing:0.10em;color:#9ca3af;"
-            "border-bottom:1px solid var(--border);'>Weight</th>"
-            "</tr></thead>"
-            f"<tbody>{''.join(rows_html)}</tbody></table>",
-            unsafe_allow_html=True,
+    _render_receiving(bol.receiving)
+
+
+# ----------------------------- POD --------------------------------------------
+
+
+def render_pod_debug(pod) -> None:
+    if pod is None:
+        return
+    _section("Header")
+    _kv_grid([
+        ("Referenced BOL", pod.referenced_bol),
+        ("Referenced PO", pod.referenced_po),
+    ])
+    _render_receiving(pod.receiving)
+
+
+def _render_receiving(receiving) -> None:
+    """Shared receiving-evidence renderer used by BOL and POD."""
+    if receiving is None:
+        _section("Receiving evidence")
+        _html("<div class='dbg-meta'><span class='v muted'>None captured.</span></div>")
+        return
+
+    has_stamp = bool(receiving.has_receiving_stamp)
+    short = bool(receiving.aggregate_shortage)
+    pill_stamp = (
+        "<span class='dbg-pill ok'>stamp present</span>" if has_stamp
+        else "<span class='dbg-pill'>no stamp</span>"
+    )
+    pill_short = (
+        "<span class='dbg-pill warn'>aggregate shortage</span>" if short
+        else "<span class='dbg-pill ok'>no aggregate shortage</span>"
+    )
+    _html(
+        f"<div class='dbg-section' style='display:flex;align-items:center;"
+        f"justify-content:space-between;'>"
+        f"<span>Receiving evidence</span>"
+        f"<span style='display:inline-flex;gap:6px;'>{pill_stamp}{pill_short}</span>"
+        f"</div>"
+    )
+
+    shipped = receiving.total_cases_shipped
+    received = receiving.total_cases_received
+    delta_v = None
+    if shipped is not None and received is not None:
+        try:
+            delta_v = float(received) - float(shipped)
+        except (TypeError, ValueError):
+            delta_v = None
+    _kv_grid([
+        ("Cases shipped", _fmt_num(shipped)),
+        ("Cases received", _fmt_num(received)),
+        ("Delta", _fmt_num(delta_v) if delta_v is not None else "—"),
+        ("Stamp notes", receiving.stamp_notes),
+    ])
+
+    excs = list(receiving.line_level_exceptions or [])
+    if excs:
+        _section("Line-level exceptions")
+        cols = [("Note", "")]
+        rows = [[(_fmt_text(e), "")] for e in excs]
+        _table(cols, rows)
+
+
+# ----------------------------- Remittance -------------------------------------
+
+
+def render_remit_debug(remit) -> None:
+    if remit is None:
+        return
+    _section("Header")
+    _kv_grid([
+        ("Originator", remit.originator),
+        ("Effective date", remit.effective_date),
+        ("Lines", len(remit.lines)),
+    ])
+
+    _section(f"Remittance lines ({len(remit.lines)})")
+    cols = [
+        ("Seller invoice #", "mono"),
+        ("Type", ""),
+        ("Invoice $", "num"),
+        ("Terms disc $", "num"),
+        ("Net paid $", "num"),
+    ]
+    rows = []
+    for ln in remit.lines:
+        kind = (
+            "<span class='dbg-pill warn'>credit memo</span>"
+            if ln.is_credit_memo
+            else "<span class='dbg-pill info'>invoice</span>"
         )
+        amt_cls = "neg" if (ln.invoice_amount is not None and ln.invoice_amount < 0) else ""
+        rows.append([
+            (_fmt_text(ln.seller_invoice_num), ""),
+            (kind, ""),
+            (_fmt_money(ln.invoice_amount), amt_cls),
+            (_fmt_money(ln.terms_discount), ""),
+            (_fmt_money(ln.net_amount_paid), ""),
+        ])
+    _table(cols, rows, empty_msg="No remittance lines extracted.")
+
+
+# ----------------------------- Claim ------------------------------------------
+
+
+def render_claim_debug(claim) -> None:
+    if claim is None:
+        return
+    _section("Header")
+    _kv_grid([
+        ("Invoice #", claim.invoice_number),
+        ("PO #", claim.po_number),
+        ("Deduction $", _fmt_money(claim.deduction_amount)),
+        ("Gross invoice $", _fmt_money(claim.gross_invoice_amount)),
+        ("Net invoice $", _fmt_money(claim.net_invoice_amount)),
+        ("Discount $", _fmt_money(claim.discount_amount)),
+    ])
+
+    _section(f"Claim lines ({len(claim.lines)})")
+    cols = [
+        ("UPC", "mono"),
+        ("Description", ""),
+        ("Qty", "num"),
+        ("Unit $", "num"),
+        ("Amount", "num"),
+        ("Reason", "mono"),
+        ("Type", ""),
+    ]
+    rows = []
+    for ln in claim.lines:
+        amt_cls = "neg" if (ln.adj_amount is not None and ln.adj_amount < 0) else ""
+        ctype = ln.claim_type.value if hasattr(ln.claim_type, "value") else str(ln.claim_type)
+        ctype_pill = (
+            f"<span class='dbg-pill info' title='confidence "
+            f"{ln.claim_type_confidence:.2f}'>{_esc(ctype)}</span>"
+        )
+        reason = (
+            ln.reason_code or "—"
+        )
+        if ln.reason_text:
+            reason = f"{reason} · {ln.reason_text}"
+        rows.append([
+            (_fmt_text(ln.upc), ""),
+            (_fmt_text(ln.description), ""),
+            (_fmt_num(ln.adj_qty), ""),
+            (_fmt_money(ln.unit_price), ""),
+            (_fmt_money(ln.adj_amount), amt_cls),
+            (_fmt_text(reason), ""),
+            (ctype_pill, ""),
+        ])
+    _table(cols, rows, empty_msg="No claim lines extracted.")
+
+
+# ----------------------------- Dispatch ---------------------------------------
+
+
+def render_doc_debug(label: str, doc) -> None:
+    """Dispatch a document to its tabular renderer based on label."""
+    if doc is None:
+        st.caption(f"No {label.lower()} document in this bundle.")
+        return
+    _render_doc_meta(doc)
+    if label == "Invoice":
+        render_invoice_debug(doc)
+    elif label == "BOL":
+        render_bol_debug(doc)
+    elif label == "POD":
+        render_pod_debug(doc)
+    elif label == "Remittance":
+        render_remit_debug(doc)
+    elif label == "Claim":
+        render_claim_debug(doc)
+    else:
+        st.json(doc.model_dump())
+        return
+    with st.expander("Show raw JSON", expanded=False):
+        st.json(doc.model_dump())
 
 
 def render_empty_state() -> None:
