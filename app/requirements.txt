@@ -1,0 +1,25 @@
+# LLM access is provider-agnostic (OpenAI-compatible chat completions).
+# We call it via httpx so neither the `groq` nor the `openai` SDK is required.
+httpx>=0.27.0
+pydantic>=2.6.0
+pdfplumber>=0.11.0
+PyMuPDF>=1.24.0
+Pillow>=10.0.0
+python-dotenv>=1.0.0
+typer>=0.12.0
+rich>=13.7.0
+streamlit>=1.36.0
+pandas>=2.2.0
+tenacity>=8.2.0
+# Local OCR fallback (tier 2 before vision LLM). Downloads ~1GB weights on
+# first use; kept optional via lazy import so the rest of the pipeline runs
+# without it.
+surya-ocr>=0.17.0,<0.18
+# surya 0.17.x is not compatible with transformers 5.x yet:
+# https://github.com/datalab-to/surya/issues/492 — pin the last 4.x line.
+transformers>=4.56.1,<5
+# OpenCV for receiving-stamp detection / image preprocessing (CLAHE,
+# binarization, deskew). Surya already pulls in opencv-python-headless
+# transitively but we pin it so fresh installs don't silently miss it.
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
